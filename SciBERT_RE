@@ -1,0 +1,152 @@
+import torch
+from torch.utils.data import Dataset, DataLoader
+from transformers import AutoTokenizer, AutoModel, get_scheduler
+from sklearn.metrics import classification_report
+import torch.nn as nn
+import optuna
+import torch.optim as optim
+from torch.optim import AdamW
+import pandas as pd
+# Set device
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# Relation map
+label_names = ['Coreference', 'Helps_In', 'Includes', 'Used_For', 'Synonym_Of', 'Seasonal', 'Origin_Of', 'Caused_By', 'Conjunction']
+relation_map = {label: idx for idx, label in enumerate(label_names)}  # Extend with more relations as needed
+num_relations = len(relation_map)
+
+# Load SpanBERT tokenizer and model
+tokenizer = AutoTokenizer.from_pretrained("allenai/scibert_scivocab_uncased")
+
+spanbert = AutoModel.from_pretrained("allenai/scibert_scivocab_uncased")
+spanbert.to(device)
+
+class REDataset(Dataset):
+    def __init__(self, data, tokenizer, relation_map, max_len=128):
+        self.data = pd.read_csv(data)
+        self.tokenizer = tokenizer
+        self.relation_map = relation_map
+        self.max_len = max_len
+
+    def __len__(self):
+        return len(self.data)
+
+    def __getitem__(self, idx):
+
+        example = self.data.iloc[idx]
+        sentence = example["generated_sentence"]
+        entity1 = example["entity1"]
+        entity2 = example["entity2"]
+        relation = example["relation"].strip()
+
+        # Tokenize with entity markers
+        marked_sentence = sentence.replace(str(entity1), f"[E1]{str(entity1)}[/E1]").replace(str(entity2), f"[E2]{str(entity2)}[/E2]")
+        tokens = self.tokenizer(
+            marked_sentence,
+            padding="max_length",
+            truncation=True,
+            max_length=self.max_len,
+            return_tensors="pt",
+        )
+
+        # Prepare labels
+        label = self.relation_map[relation]
+        return {
+            "input_ids": tokens["input_ids"].squeeze(0),
+            "attention_mask": tokens["attention_mask"].squeeze(0),
+            "label": torch.tensor(label),
+        }
+
+re_data = "D:/Sayan/auto_data_create/new_data.csv"
+class RelationExtractionModel(nn.Module):
+    def __init__(self, spanbert, num_relations, dropout_rate):
+        super(RelationExtractionModel, self).__init__()
+        self.spanbert = spanbert
+        self.dropout = nn.Dropout(dropout_rate)
+        self.classifier = nn.Linear(spanbert.config.hidden_size, num_relations)
+
+    def forward(self, input_ids, attention_mask):
+        outputs = self.spanbert(input_ids=input_ids, attention_mask=attention_mask)
+        cls_output = outputs.last_hidden_state[:, 0, :]  # Use [CLS] token's representation
+        cls_output = self.dropout(cls_output)
+        logits = self.classifier(cls_output)
+        return logits
+
+def train_model(model, train_loader, optimizer, criterion, scheduler, num_epochs):
+    model.train()
+    for epoch in range(num_epochs):
+        total_loss = 0
+        for batch in train_loader:
+            optimizer.zero_grad()
+            input_ids = batch["input_ids"].to(device)
+            attention_mask = batch["attention_mask"].to(device)
+            labels = batch["label"].to(device)
+
+            logits = model(input_ids=input_ids, attention_mask=attention_mask)
+            loss = criterion(logits, labels)
+            total_loss += loss.item()
+
+            loss.backward()
+            optimizer.step()
+            scheduler.step()
+        print(f"Epoch {epoch + 1}/{num_epochs}, Loss: {total_loss:.4f}")
+
+def evaluate_model(model, data_loader):
+    model.eval()
+    all_preds, all_labels = [], []
+
+    with torch.no_grad():
+        for batch in data_loader:
+            input_ids = batch["input_ids"].to(device)
+            attention_mask = batch["attention_mask"].to(device)
+            labels = batch["label"].to(device)
+
+            logits = model(input_ids=input_ids, attention_mask=attention_mask)
+            preds = torch.argmax(logits, dim=1).cpu().numpy()
+            all_preds.extend(preds)
+            all_labels.extend(labels.cpu().numpy())
+
+    print(classification_report(all_labels, all_preds, target_names=relation_map.keys()))
+    return classification_report(all_labels, all_preds, output_dict=True)["accuracy"]
+
+def objective(trial):
+    # Hyperparameters to tune
+    learning_rate = trial.suggest_float("learning_rate", 1e-5, 5e-4)
+    batch_size = trial.suggest_categorical("batch_size", [8, 16, 32])
+    num_epochs = trial.suggest_int("max_epochs", 5, 15)
+    dropout_rate = trial.suggest_float("dropout_rate", 0.1, 0.5)
+    weight_decay = trial.suggest_float("weight_decay", 1e-6, 1e-2)
+    warmup_steps_ratio = trial.suggest_float("warmup_steps_ratio", 0.0, 0.2)
+    max_grad_norm = trial.suggest_float("max_grad_norm", 0.5, 5.0)
+
+    # DataLoader
+    train_dataset = REDataset(re_data, tokenizer, relation_map)
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+
+    # Define model
+    model = RelationExtractionModel(spanbert, num_relations, dropout_rate)
+    model.to(device)
+
+    # Optimizer and Scheduler
+    optimizer = AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
+    total_steps = len(train_loader) * num_epochs
+    warmup_steps = int(total_steps * warmup_steps_ratio)
+    scheduler = get_scheduler("linear", optimizer=optimizer, num_warmup_steps=warmup_steps, num_training_steps=total_steps)
+
+    # Loss function
+    criterion = nn.CrossEntropyLoss()
+
+    # Train and evaluate model
+    train_model(model, train_loader, optimizer, criterion, scheduler, num_epochs)
+    accuracy = evaluate_model(model, train_loader)
+
+    return accuracy
+
+if __name__ == "__main__":
+    # Run Optuna study
+    study = optuna.create_study(direction="maximize")
+    study.optimize(objective, n_trials=20)
+
+    # Best hyperparameters
+    print("Best Hyperparameters:")
+    print(study.best_params)
